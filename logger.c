@@ -3,6 +3,8 @@
 #include<linux/kernel.h>
 #include<linux/fs.h>
 #include<linux/cdev.h>
+#include<linux/uaccess.h>
+#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("EVENT LOGGER PROJECT");
@@ -13,6 +15,8 @@ MODULE_AUTHOR("JAYARAJ");
 #define BASEMINOR    0
 #define COUNT        1
 #define DEVICE_NAME  "eventlogger"
+
+#define BUFFER_SIZE   100
 /***************************************************/
 
 /*------------structure declaration----------------*/
@@ -30,16 +34,112 @@ static int event_open(struct inode *inode,struct file *file);
 static int event_release(struct inode *inode,struct file *file);
 /*****************************************************/
 
-static int event_open(struct inode *inode,struct file *file){
-	pr_info("File opened successfully...\n");
-	return 0;
+/*-----------device private structures------------*/
+typedef struct{
+	char data[BUFFER_SIZE];
+	size_t length;
+}event_dev_data;
+
+static event_dev_data event_data;
+
+/**************************************************/
+
+
+static int event_open(struct inode *inode, struct file *filp) {
+    pr_info("File opened successfully...\n");
+
+    // Moved lines 44 & 45 here so they execute cleanly
+    //strscpy(event_data.data, "hello world", sizeof(event_data.data));
+    //event_data.length = strlen(event_data.data);
+
+    return 0;
 }
-static int event_release(struct inode *inode,struct file *file){
+static ssize_t event_read(struct file *filp,char __user *buf,size_t count,loff_t *offset){
+	size_t bytes_available = 0;
+    if(filp == NULL){
+    	pr_err("%s:%d, File pointer is not valid\n",__func__,__LINE__);
+    	return -EINVAL;
+    }
+    if(buf == NULL){
+    	pr_err("%s:%d, Invalid user buffer (NULL)\n",__func__,__LINE__);
+    	return -EINVAL;
+    }
+    if(count <= 0){
+    	 pr_err("%s:%d, Invalid Count value\n",__func__,__LINE__);
+    	 return -EINVAL;
+    }
+    if(offset == NULL){
+    	pr_err("%s:%d, Offset pointer is invalid\n",__func__,__LINE__);
+    	return -EINVAL;
+    }
+    if(*offset > BUFFER_SIZE){
+    	return 0;
+    }
+    bytes_available = event_data.length - (*offset);
+    pr_debug("%s:%d bytes_available = %ld\n",__func__,__LINE__,bytes_available);
+    pr_debug("%s:%d read byte count = %ld\n",__func__,__LINE__,count);
+    pr_debug("%s:%d read offset = %lld\n",__func__,__LINE__,*offset);
+    if(count > bytes_available){
+    	   count = bytes_available;
+    }
+    if(copy_to_user(buf,event_data.data + *offset,count)){
+    	    pr_err("%s:%d, copy_to_user Failed\n",__func__,__LINE__);
+    	    return -EFAULT;
+    }
+    *offset+=count;
+
+    return count;
+
+
+
+
+
+}
+static ssize_t event_write(struct file *filp,const char __user *buf,size_t count,loff_t *offset){
+    size_t space_available = 0;
+    if(filp == NULL){
+    	pr_err("%s:%d, File pointer is not valid\n",__func__,__LINE__);
+    	return -EINVAL;
+    }
+    if(buf == NULL){
+    	pr_err("%s:%d, Invalid user buffer (NULL)\n",__func__,__LINE__);
+    	return -EINVAL;
+    }
+    if(count <= 0){
+    	 pr_err("%s:%d, Invalid Count value\n",__func__,__LINE__);
+    	 return -EINVAL;
+    }
+    if(offset == NULL){
+    	pr_err("%s:%d, Offset pointer is invalid\n",__func__,__LINE__);
+    	return -EINVAL;
+    }
+    if(*offset > BUFFER_SIZE){
+    	return -ENOSPC;
+    }
+    space_available = BUFFER_SIZE - (*offset);
+    pr_debug("%s:%d space_available = %ld\n",__func__,__LINE__,space_available);
+    pr_debug("%s:%d write byte count = %ld\n",__func__,__LINE__,count);
+    pr_debug("%s:%d write offset = %lld\n",__func__,__LINE__,*offset);
+    if(count > space_available){
+    	   count = space_available;
+    }
+    if(copy_from_user(event_data.data + *offset,buf,count)){
+    	    pr_err("%s:%d, copy_from_user Failed\n",__func__,__LINE__);
+    	    return -EFAULT;
+    }
+    *offset+=count;
+    event_data.length = *offset;
+
+    return count;
+}
+static int event_release(struct inode *inode,struct file *filp){
 	pr_info("File closed successfully...");
 	return 0;
 }
 static struct file_operations event_fops = {
 	.open = event_open,
+	.read= event_read,
+	.write = event_write,
 	.release = event_release
 };
 
