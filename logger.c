@@ -7,6 +7,8 @@
 #include <linux/string.h>
 #include<linux/hrtimer.h>
 #include<linux/ktime.h>
+
+#include<linux/spinlock.h>
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("EVENT LOGGER PROJECT");
 MODULE_AUTHOR("JAYARAJ");
@@ -18,6 +20,7 @@ MODULE_AUTHOR("JAYARAJ");
 #define DEVICE_NAME  "eventlogger"
 
 #define BUFFER_SIZE   100
+#define CAPACITY      100
 /***************************************************/
 
 /*------------structure declaration----------------*/
@@ -30,12 +33,15 @@ static struct class *event_class;
 static struct device *event_device;
 
 static struct hrtimer event_timer;
+
+spinlock_t lock;
 /******************************************************/
 
 /*-----------function prototype----------------------*/
 static int event_open(struct inode *inode,struct file *file);
 static int event_release(struct inode *inode,struct file *file);
 enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer);
+static int timestamp_read(struct file *filp,const char __user *buf,size_t count,loff_t *offset);
 /*****************************************************/
 
 /*-----------device private structures------------*/
@@ -46,6 +52,16 @@ typedef struct{
 
 static event_dev_data event_data;
 
+typedef struct event_timestamp{
+    ktime_t time;
+}timestamp;
+typedef struct buffer{
+    timestamp arr[CAPACITY];
+    uint8_t head;
+    uint8_t tail;
+    uint8_t count;
+}event_buf;
+static event_buf ring_buf;
 /**************************************************/
 
 
@@ -140,15 +156,36 @@ static int event_release(struct inode *inode,struct file *filp){
 	pr_info("File closed successfully...");
 	return 0;
 }
+
+static int timestamp_read(struct file *filp,const char __user *buf,size_t count,loff_t *offset){
+    unsigned int flags;
+    spin_lock_irqsave(&lock,flags);
+    if(ring_buf.head == ring_buf.tail){
+        pr_info("Event Buffer is empty..\n");
+        spin_unlock_irqsave(&lock,flags);
+    }
+    else{
+        pr_info("Event:%d,timestamp:%d\n",ring_buf.tail+1,ring_buf.arr[ring_buf.tail].time);
+        ring_buf.tail = (ring_buf.tail + 1) % CAPACITY;
+        ring_buf.count--;
+    }
+    spin_unlock_irqsave(&lock,flags);
+    return 0;
+}
 static struct file_operations event_fops = {
 	.open = event_open,
-	.read= event_read,
+	.read= timestamp_read,
 	.write = event_write,
 	.release = event_release
 };
 
 enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer) {
     pr_info("hr timer interrupt triggered every 5 sec once...\n");
+    spin_lock(&lock);
+    ring_buf.arr[ring_buf.head].time = ktime_get();
+    ring_buf.count++;
+    spin_unlock(&lock);
+    ring_buf.head = (ring_buf.head + 1) % CAPACITY;
     hrtimer_forward_now(event_timer,ktime_set(5,0));
     return HRTIMER_RESTART;
 }
@@ -163,6 +200,8 @@ static void init_hrtimer(void){
     pr_info("hrtime init done");
 
 }
+
+
 static int __init eventInit(void){
 	int ret = 0;
 	ret = alloc_chrdev_region(&event_dev,BASEMINOR,COUNT,DEVICE_NAME);
@@ -205,6 +244,7 @@ static int __init eventInit(void){
          return ret;
     }
     init_hrtimer();
+    spin_lock_init(&lock);
 	pr_info("Module init done...\n");
 	pr_info("Device Name : %s\n",DEVICE_NAME);
 	pr_info("major = %d, minor = %d\n",MAJOR(event_dev),MINOR(event_dev));
