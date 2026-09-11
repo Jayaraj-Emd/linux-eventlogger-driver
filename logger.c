@@ -5,7 +5,8 @@
 #include<linux/cdev.h>
 #include<linux/uaccess.h>
 #include <linux/string.h>
-
+#include<linux/hrtimer.h>
+#include<linux/ktime.h>
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("EVENT LOGGER PROJECT");
 MODULE_AUTHOR("JAYARAJ");
@@ -27,11 +28,14 @@ static struct cdev *event_cdev;
 static struct class *event_class;
 
 static struct device *event_device;
+
+static struct hrtimer event_timer;
 /******************************************************/
 
 /*-----------function prototype----------------------*/
 static int event_open(struct inode *inode,struct file *file);
 static int event_release(struct inode *inode,struct file *file);
+enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer);
 /*****************************************************/
 
 /*-----------device private structures------------*/
@@ -72,7 +76,7 @@ static ssize_t event_read(struct file *filp,char __user *buf,size_t count,loff_t
     	pr_err("%s:%d, Offset pointer is invalid\n",__func__,__LINE__);
     	return -EINVAL;
     }
-    if(*offset > BUFFER_SIZE){
+    if(*offset >= event_data.length){
     	return 0;
     }
     bytes_available = event_data.length - (*offset);
@@ -143,6 +147,22 @@ static struct file_operations event_fops = {
 	.release = event_release
 };
 
+enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer) {
+    pr_info("hr timer interrupt triggered every 5 sec once...\n");
+    hrtimer_forward_now(event_timer,ktime_set(5,0));
+    return HRTIMER_RESTART;
+}
+
+static void init_hrtimer(void){
+    pr_info("hrtimer initlization starts....\n");
+    ktime_t tim;
+    tim = ktime_set(5,0);
+    hrtimer_init(&event_timer,CLOCK_MONOTONIC,HRTIMER_MODE_REL);
+    event_timer.function = event_timer_callback;
+    hrtimer_start(&event_timer,tim,HRTIMER_MODE_REL);
+    pr_info("hrtime init done");
+
+}
 static int __init eventInit(void){
 	int ret = 0;
 	ret = alloc_chrdev_region(&event_dev,BASEMINOR,COUNT,DEVICE_NAME);
@@ -184,12 +204,14 @@ static int __init eventInit(void){
          pr_err("Failed to create device: error code %d\n", ret);
          return ret;
     }
+    init_hrtimer();
 	pr_info("Module init done...\n");
 	pr_info("Device Name : %s\n",DEVICE_NAME);
 	pr_info("major = %d, minor = %d\n",MAJOR(event_dev),MINOR(event_dev));
 	return 0;
 }
 static void __exit eventExit(void){
+         hrtimer_cancel(&event_timer);
          device_destroy(event_class,event_dev);
          class_destroy(event_class);
          cdev_del(event_cdev);
