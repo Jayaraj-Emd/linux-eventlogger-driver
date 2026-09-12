@@ -41,7 +41,6 @@ spinlock_t lock;
 static int event_open(struct inode *inode,struct file *file);
 static int event_release(struct inode *inode,struct file *file);
 enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer);
-static int timestamp_read(struct file *filp,const char __user *buf,size_t count,loff_t *offset);
 /*****************************************************/
 
 /*-----------device private structures------------*/
@@ -62,6 +61,8 @@ typedef struct buffer{
     uint8_t count;
 }event_buf;
 static event_buf ring_buf;
+static uint64_t total_events_logged = 0;
+
 /**************************************************/
 
 
@@ -74,7 +75,7 @@ static int event_open(struct inode *inode, struct file *filp) {
 
     return 0;
 }
-static ssize_t event_read(struct file *filp,char __user *buf,size_t count,loff_t *offset){
+/*static ssize_t event_read(struct file *filp,char __user *buf,size_t count,loff_t *offset){
 	size_t bytes_available = 0;
     if(filp == NULL){
     	pr_err("%s:%d, File pointer is not valid\n",__func__,__LINE__);
@@ -114,7 +115,7 @@ static ssize_t event_read(struct file *filp,char __user *buf,size_t count,loff_t
 
 
 
-}
+}*/
 static ssize_t event_write(struct file *filp,const char __user *buf,size_t count,loff_t *offset){
     size_t space_available = 0;
     if(filp == NULL){
@@ -157,19 +158,19 @@ static int event_release(struct inode *inode,struct file *filp){
 	return 0;
 }
 
-static int timestamp_read(struct file *filp,const char __user *buf,size_t count,loff_t *offset){
-    unsigned int flags;
+static ssize_t timestamp_read(struct file *filp,char __user *buf,size_t count,loff_t *offset){
+    unsigned long flags;
     spin_lock_irqsave(&lock,flags);
-    if(ring_buf.head == ring_buf.tail){
+    if(ring_buf.count == 0){
         pr_info("Event Buffer is empty..\n");
-        spin_unlock_irqsave(&lock,flags);
+           spin_unlock_irqrestore(&lock, flags);   
     }
     else{
-        pr_info("Event:%d,timestamp:%d\n",ring_buf.tail+1,ring_buf.arr[ring_buf.tail].time);
+        pr_info("Event:%llu,timestamp:%lld\n",total_events_logged,ring_buf.arr[ring_buf.tail].time);
         ring_buf.tail = (ring_buf.tail + 1) % CAPACITY;
         ring_buf.count--;
     }
-    spin_unlock_irqsave(&lock,flags);
+       spin_unlock_irqrestore(&lock, flags);
     return 0;
 }
 static struct file_operations event_fops = {
@@ -181,11 +182,14 @@ static struct file_operations event_fops = {
 
 enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer) {
     pr_info("hr timer interrupt triggered every 5 sec once...\n");
-    spin_lock(&lock);
+    unsigned long flags;
+    spin_lock_irqsave(&lock,flags);
     ring_buf.arr[ring_buf.head].time = ktime_get();
     ring_buf.count++;
-    spin_unlock(&lock);
     ring_buf.head = (ring_buf.head + 1) % CAPACITY;
+    total_events_logged++;
+    spin_unlock_irqrestore(&lock, flags);
+    
     hrtimer_forward_now(event_timer,ktime_set(5,0));
     return HRTIMER_RESTART;
 }
@@ -243,8 +247,10 @@ static int __init eventInit(void){
          pr_err("Failed to create device: error code %d\n", ret);
          return ret;
     }
-    init_hrtimer();
+    
     spin_lock_init(&lock);
+    init_hrtimer();
+
 	pr_info("Module init done...\n");
 	pr_info("Device Name : %s\n",DEVICE_NAME);
 	pr_info("major = %d, minor = %d\n",MAJOR(event_dev),MINOR(event_dev));
