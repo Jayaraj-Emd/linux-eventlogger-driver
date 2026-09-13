@@ -58,7 +58,7 @@ typedef struct buffer{
     timestamp arr[CAPACITY];
     uint8_t head;
     uint8_t tail;
-    uint8_t count;
+    uint64_t count;
 }event_buf;
 static event_buf ring_buf;
 static uint64_t total_events_logged = 0;
@@ -159,19 +159,32 @@ static int event_release(struct inode *inode,struct file *filp){
 }
 
 static ssize_t timestamp_read(struct file *filp,char __user *buf,size_t count,loff_t *offset){
+    char kbuf[64];
+    int len;
+    ktime_t event_time;
+
     unsigned long flags;
+    u64 event_number;
     spin_lock_irqsave(&lock,flags);
     if(ring_buf.count == 0){
         pr_info("Event Buffer is empty..\n");
-           spin_unlock_irqrestore(&lock, flags);   
+        spin_unlock_irqrestore(&lock, flags);  
+        return 0; 
     }
-    else{
-        pr_info("Event:%llu,timestamp:%lld\n",total_events_logged,ring_buf.arr[ring_buf.tail].time);
-        ring_buf.tail = (ring_buf.tail + 1) % CAPACITY;
-        ring_buf.count--;
+    
+    event_time = ring_buf.arr[ring_buf.tail].time;
+    event_number = total_events_logged - ring_buf.count + 1;
+    ring_buf.tail = (ring_buf.tail + 1) % CAPACITY;
+    ring_buf.count--;
+    spin_unlock_irqrestore(&lock, flags);
+    len = snprintf(kbuf,sizeof(kbuf),"Event:%llu,timestamp:%lld\n",event_number, (long long)event_time);
+    if(len > count){
+        len = count;
     }
-       spin_unlock_irqrestore(&lock, flags);
-    return 0;
+    if(copy_to_user(buf,kbuf,len)){
+        return -EFAULT;
+    }
+    return len;
 }
 static struct file_operations event_fops = {
 	.open = event_open,
@@ -184,13 +197,20 @@ enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer) {
     pr_info("hr timer interrupt triggered every 5 sec once...\n");
     unsigned long flags;
     spin_lock_irqsave(&lock,flags);
-    ring_buf.arr[ring_buf.head].time = ktime_get();
-    ring_buf.count++;
-    ring_buf.head = (ring_buf.head + 1) % CAPACITY;
-    total_events_logged++;
-    spin_unlock_irqrestore(&lock, flags);
+    if(ring_buf.count >= CAPACITY){
+        spin_unlock_irqrestore(&lock,flags);
+        pr_warn("Event buffer full, dropping event\n");
+    }
+    else{
+        ring_buf.arr[ring_buf.head].time = ktime_get();
+        ring_buf.count++;
+        ring_buf.head = (ring_buf.head + 1) % CAPACITY;
+        total_events_logged++;
+        spin_unlock_irqrestore(&lock, flags);   
+    }
+
     
-    hrtimer_forward_now(event_timer,ktime_set(5,0));
+    hrtimer_forward_now(event_timer,ktime_set(0,100000000));
     return HRTIMER_RESTART;
 }
 
