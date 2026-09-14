@@ -10,6 +10,12 @@
 #include<linux/wait.h>
 #include<linux/spinlock.h>
 #include <linux/workqueue.h>
+#include<linux/ioctl.h>
+
+
+#define MAGIC_NUM    'k'
+#define GET_TOTAL_EVENT_LOGGED  _IOR(MAGIC_NUM,1,uint64_t)
+#define GET_RING_BUF_COUNT  _IOR(MAGIC_NUM,2,uint64_t)
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("EVENT LOGGER PROJECT");
 MODULE_AUTHOR("JAYARAJ");
@@ -198,11 +204,41 @@ static ssize_t timestamp_read(struct file *filp,char __user *buf,size_t count,lo
     }
     return len;
 }
+
+static long event_ioctl_handler(struct file *filp,unsigned int cmd,unsigned long arg){
+    uint64_t total_event;
+    uint64_t total_buf_count;
+    unsigned long flags;
+    spin_lock_irqsave(&lock,flags);
+    total_event = total_events_logged;
+    total_buf_count = ring_buf.count;
+    spin_unlock_irqrestore(&lock,flags);
+
+    switch(cmd){
+    case GET_RING_BUF_COUNT:
+        if(copy_to_user((int __user *)arg,&total_buf_count,sizeof(total_buf_count))){
+            return -EFAULT;
+        }
+        pr_info("Driver: ring buffer present count read successfully\n");
+        break;
+    case GET_TOTAL_EVENT_LOGGED:
+        if(copy_to_user((int __user *)arg,&total_event,sizeof(total_event))){
+            return -EFAULT;
+        }
+        pr_info("Driver: Total number of event read successfully..\n");
+        break;
+    default:
+        return -ENOTTY;
+    }
+    return 0;
+
+}
 static struct file_operations event_fops = {
 	.open = event_open,
 	.read= timestamp_read,
 	.write = event_write,
-	.release = event_release
+	.release = event_release,
+    .unlocked_ioctl = event_ioctl_handler
 };
 
 enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer) {
