@@ -1,7 +1,12 @@
-obj-m+=logger.o 
-KDIR :=/lib/modules/$(shell uname -r)/build
-PWD  :=$(shell pwd)
+obj-m += logger.o
+
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+ccflags-y := -g -O0
+
 all:
-	make -C $(KDIR) M=$(PWD)
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
 clean:
-	make -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(PWD) clean

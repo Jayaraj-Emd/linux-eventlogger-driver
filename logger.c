@@ -10,9 +10,10 @@
 #include<linux/wait.h>
 #include<linux/spinlock.h>
 #include <linux/workqueue.h>
+#include<linux/kthread.h>
 #include<linux/ioctl.h>
-
-
+#include<linux/delay.h>
+#include<linux/sched.h>
 #define MAGIC_NUM    'k'
 #define GET_TOTAL_EVENT_LOGGED  _IOR(MAGIC_NUM,1,uint64_t)
 #define GET_RING_BUF_COUNT  _IOR(MAGIC_NUM,2,uint64_t)
@@ -43,6 +44,7 @@ static struct hrtimer event_timer;
 
 static struct work_struct event_work;
 
+static struct task_struct *thread;
 spinlock_t lock;
 wait_queue_head_t event_queue;
 /******************************************************/
@@ -53,6 +55,8 @@ static int event_release(struct inode *inode,struct file *file);
 enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer);
 
 static void event_work_handler(struct work_struct *work);
+static int event_data_poll(void *data);
+static void init_kthread(void);
 /*****************************************************/
 
 /*-----------device private structures------------*/
@@ -252,8 +256,8 @@ static void init_hrtimer(void){
     pr_info("hrtimer initlization starts....\n");
     ktime_t tim;
     tim = ktime_set(5,0);
-    hrtimer_init(&event_timer,CLOCK_MONOTONIC,HRTIMER_MODE_REL);
-    event_timer.function = event_timer_callback;
+    hrtimer_setup(&event_timer, event_timer_callback,
+              CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     hrtimer_start(&event_timer,tim,HRTIMER_MODE_REL);
     pr_info("hrtime init done");
 
@@ -278,6 +282,27 @@ static void event_work_handler(struct work_struct *work){
 
 }
 
+static int event_data_poll(void *data){
+    unsigned long flags;
+    while(!(kthread_should_stop())){
+        spin_lock_irqsave(&lock,flags);
+        pr_info("Total event polled into buffer = %llu\n",total_events_logged);
+        pr_info("Number of event remaining in buffer=%llu\n",ring_buf.count);
+        spin_unlock_irqrestore(&lock,flags);
+        schedule_timeout_interruptible(6000);    
+    }
+    return 0;
+
+}
+static void init_kthread(void){
+    thread = kthread_create(event_data_poll,NULL,"KTHREAD_FOR_POLL");
+    if(thread){
+        wake_up_process(thread);
+    }
+    else{
+        pr_err("Cannot create kthread\n");
+    }
+}
 static int __init eventInit(void){
 	int ret = 0;
 	ret = alloc_chrdev_region(&event_dev,BASEMINOR,COUNT,DEVICE_NAME);
@@ -324,7 +349,7 @@ static int __init eventInit(void){
     INIT_WORK(&event_work, event_work_handler);
     init_waitqueue_head(&event_queue);
     init_hrtimer();
-
+    init_kthread();
 
 	pr_info("Module init done...\n");
 	pr_info("Device Name : %s\n",DEVICE_NAME);
@@ -332,6 +357,7 @@ static int __init eventInit(void){
 	return 0;
 }
 static void __exit eventExit(void){
+         kthread_stop(thread);
          hrtimer_cancel(&event_timer);
          cancel_work_sync(&event_work);
          device_destroy(event_class,event_dev);
