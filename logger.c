@@ -14,6 +14,11 @@
 #include<linux/ioctl.h>
 #include<linux/delay.h>
 #include<linux/sched.h>
+
+#include <linux/interrupt.h>
+#include <linux/gpio/consumer.h>
+#include <linux/gpio/machine.h>
+
 #define MAGIC_NUM    'k'
 #define GET_TOTAL_EVENT_LOGGED  _IOR(MAGIC_NUM,1,uint64_t)
 #define GET_RING_BUF_COUNT  _IOR(MAGIC_NUM,2,uint64_t)
@@ -47,6 +52,19 @@ static struct work_struct event_work;
 static struct task_struct *thread;
 spinlock_t lock;
 wait_queue_head_t event_queue;
+
+static struct gpio_desc *button;
+static unsigned irq;
+static struct gpiod_lookup_table gpios_table = {
+    .dev_id = DEVICE_NAME,
+    .table = {
+        GPIO_LOOKUP("pinctrl-rp1",
+                     17,
+                     "event-button"
+                     ,GPIO_ACTIVE_LOW),
+        {}
+    },
+};
 /******************************************************/
 
 /*-----------function prototype----------------------*/
@@ -57,6 +75,8 @@ enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer);
 static void event_work_handler(struct work_struct *work);
 static int event_data_poll(void *data);
 static void init_kthread(void);
+
+static irqreturn_t button_irq_handler(int irq, void *dev_id);
 /*****************************************************/
 
 /*-----------device private structures------------*/
@@ -252,6 +272,7 @@ enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer) {
     return HRTIMER_RESTART;
 }
 
+
 static void init_hrtimer(void){
     pr_info("hrtimer initlization starts....\n");
     ktime_t tim;
@@ -303,6 +324,11 @@ static void init_kthread(void){
         pr_err("Cannot create kthread\n");
     }
 }
+static irqreturn_t button_irq_handler(int irq, void *dev_id) {
+    pending_time = ktime_get();
+    schedule_work(&event_work);
+    return IRQ_HANDLED;
+}
 static int __init eventInit(void){
 	int ret = 0;
 	ret = alloc_chrdev_region(&event_dev,BASEMINOR,COUNT,DEVICE_NAME);
@@ -344,11 +370,49 @@ static int __init eventInit(void){
          pr_err("Failed to create device: error code %d\n", ret);
          return ret;
     }
+  gpiod_add_lookup_table(&gpios_table);
 
+  button = gpiod_get(event_device, "event-button", GPIOD_IN);
+  if (IS_ERR(button)) {
+      ret = PTR_ERR(button);
+      pr_err("Failed to get GPIO descriptor: %d\n", ret);
+      gpiod_remove_lookup_table(&gpios_table);
+      device_destroy(event_class, event_dev);
+      class_destroy(event_class);
+      cdev_del(event_cdev);
+      unregister_chrdev_region(event_dev, COUNT);
+      return ret;
+  }
+
+  ret = gpiod_direction_input(button);
+  irq = gpiod_to_irq(button);
+  if (ret < 0 || irq < 0) {
+      gpiod_put(button);
+      gpiod_remove_lookup_table(&gpios_table);
+      device_destroy(event_class, event_dev);
+      class_destroy(event_class);
+      cdev_del(event_cdev);
+      unregister_chrdev_region(event_dev, COUNT);
+      pr_err("GPIO direction configuration failed\n");
+      return (ret < 0) ? ret : irq;
+  }
+
+  ret = request_irq(irq, button_irq_handler, IRQF_TRIGGER_FALLING,
+                     "event-button", DEVICE_NAME);
+  if (ret) {
+      gpiod_put(button);
+      gpiod_remove_lookup_table(&gpios_table);
+      device_destroy(event_class, event_dev);
+      class_destroy(event_class);
+      cdev_del(event_cdev);
+      unregister_chrdev_region(event_dev, COUNT);
+      pr_err("irq request failed\n");
+      return ret;
+  }
     spin_lock_init(&lock);
     INIT_WORK(&event_work, event_work_handler);
     init_waitqueue_head(&event_queue);
-    init_hrtimer();
+    //init_hrtimer();
     init_kthread();
 
 	pr_info("Module init done...\n");
@@ -357,8 +421,11 @@ static int __init eventInit(void){
 	return 0;
 }
 static void __exit eventExit(void){
+      free_irq(irq, DEVICE_NAME);
+      gpiod_put(button);
+      gpiod_remove_lookup_table(&gpios_table);
          kthread_stop(thread);
-         hrtimer_cancel(&event_timer);
+         //hrtimer_cancel(&event_timer);
          cancel_work_sync(&event_work);
          device_destroy(event_class,event_dev);
          class_destroy(event_class);
