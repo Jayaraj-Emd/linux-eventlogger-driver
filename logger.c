@@ -5,212 +5,108 @@
 #include<linux/cdev.h>
 #include<linux/uaccess.h>
 #include<linux/string.h>
-#include<linux/hrtimer.h>
 #include<linux/ktime.h>
 #include<linux/wait.h>
 #include<linux/spinlock.h>
-#include <linux/workqueue.h>
+#include<linux/workqueue.h>
 #include<linux/kthread.h>
 #include<linux/ioctl.h>
-#include<linux/delay.h>
 #include<linux/sched.h>
-
-#include <linux/interrupt.h>
-#include <linux/gpio/consumer.h>
-#include <linux/gpio/machine.h>
+#include<linux/interrupt.h>
+#include<linux/gpio/consumer.h>
+#include<linux/gpio/machine.h>
 
 #define MAGIC_NUM    'k'
 #define GET_TOTAL_EVENT_LOGGED  _IOR(MAGIC_NUM,1,uint64_t)
-#define GET_RING_BUF_COUNT  _IOR(MAGIC_NUM,2,uint64_t)
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("EVENT LOGGER PROJECT");
-MODULE_AUTHOR("JAYARAJ");
+#define GET_RING_BUF_COUNT      _IOR(MAGIC_NUM,2,uint64_t)
 
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("EVENT LOGGER PROJECT - GPIO interrupt driven");
+MODULE_AUTHOR("JAYARAJ");
 
 /*------------Macros-------------------------------*/
 #define BASEMINOR    0
 #define COUNT        1
 #define DEVICE_NAME  "eventlogger"
-
-#define BUFFER_SIZE   100
-#define CAPACITY      100
+#define CAPACITY     100
+#define GPIO_LINE    17
 /***************************************************/
 
 /*------------structure declaration----------------*/
-dev_t event_dev;
-
+static dev_t event_dev;
 static struct cdev *event_cdev;
-
 static struct class *event_class;
-
 static struct device *event_device;
 
-static struct hrtimer event_timer;
-
 static struct work_struct event_work;
-
 static struct task_struct *thread;
-spinlock_t lock;
-wait_queue_head_t event_queue;
+
+static spinlock_t lock;
+static wait_queue_head_t event_queue;
 
 static struct gpio_desc *button;
-static unsigned irq;
+static unsigned int irq;
+
 static struct gpiod_lookup_table gpios_table = {
     .dev_id = DEVICE_NAME,
     .table = {
-        GPIO_LOOKUP("pinctrl-rp1",
-                     17,
-                     "event-button"
-                     ,GPIO_ACTIVE_LOW),
+        GPIO_LOOKUP("pinctrl-rp1", GPIO_LINE, "event-button", GPIO_ACTIVE_LOW),
         {}
     },
 };
-/******************************************************/
 
-/*-----------function prototype----------------------*/
-static int event_open(struct inode *inode,struct file *file);
-static int event_release(struct inode *inode,struct file *file);
-enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer);
-
-static void event_work_handler(struct work_struct *work);
-static int event_data_poll(void *data);
-static void init_kthread(void);
-
-static irqreturn_t button_irq_handler(int irq, void *dev_id);
-/*****************************************************/
-
-/*-----------device private structures------------*/
-typedef struct{
-	char data[BUFFER_SIZE];
-	size_t length;
-}event_dev_data;
-
-static event_dev_data event_data;
-
-typedef struct event_timestamp{
+typedef struct {
     ktime_t time;
-}timestamp;
-typedef struct buffer{
+} timestamp;
+
+typedef struct {
     timestamp arr[CAPACITY];
     uint8_t head;
     uint8_t tail;
     uint64_t count;
-}event_buf;
+} event_buf;
+
 static event_buf ring_buf;
 static uint64_t total_events_logged = 0;
 static ktime_t pending_time;
-
 /**************************************************/
 
+/*-----------function prototypes----------------------*/
+static int event_open(struct inode *inode, struct file *filp);
+static int event_release(struct inode *inode, struct file *filp);
+static void event_work_handler(struct work_struct *work);
+static int event_stats_thread(void *data);
+static void init_stats_thread(void);
+static irqreturn_t button_irq_handler(int irq, void *dev_id);
+/*****************************************************/
 
 static int event_open(struct inode *inode, struct file *filp) {
-    pr_info("File opened successfully...\n");
-
-    // Moved lines 44 & 45 here so they execute cleanly
-    //strscpy(event_data.data, "hello world", sizeof(event_data.data));
-    //event_data.length = strlen(event_data.data);
-
+    pr_info("eventlogger: device opened by process \"%s\" (pid %d)\n",
+            current->comm, current->pid);
     return 0;
 }
-/*static ssize_t event_read(struct file *filp,char __user *buf,size_t count,loff_t *offset){
-	size_t bytes_available = 0;
-    if(filp == NULL){
-    	pr_err("%s:%d, File pointer is not valid\n",__func__,__LINE__);
-    	return -EINVAL;
-    }
-    if(buf == NULL){
-    	pr_err("%s:%d, Invalid user buffer (NULL)\n",__func__,__LINE__);
-    	return -EINVAL;
-    }
-    if(count <= 0){
-    	 pr_err("%s:%d, Invalid Count value\n",__func__,__LINE__);
-    	 return -EINVAL;
-    }
-    if(offset == NULL){
-    	pr_err("%s:%d, Offset pointer is invalid\n",__func__,__LINE__);
-    	return -EINVAL;
-    }
-    if(*offset >= event_data.length){
-    	return 0;
-    }
-    bytes_available = event_data.length - (*offset);
-    pr_debug("%s:%d bytes_available = %ld\n",__func__,__LINE__,bytes_available);
-    pr_debug("%s:%d read byte count = %ld\n",__func__,__LINE__,count);
-    pr_debug("%s:%d read offset = %lld\n",__func__,__LINE__,*offset);
-    if(count > bytes_available){
-    	   count = bytes_available;
-    }
-    if(copy_to_user(buf,event_data.data + *offset,count)){
-    	    pr_err("%s:%d, copy_to_user Failed\n",__func__,__LINE__);
-    	    return -EFAULT;
-    }
-    *offset+=count;
 
-    return count;
-
-
-
-
-
-}*/
-static ssize_t event_write(struct file *filp,const char __user *buf,size_t count,loff_t *offset){
-    size_t space_available = 0;
-    if(filp == NULL){
-    	pr_err("%s:%d, File pointer is not valid\n",__func__,__LINE__);
-    	return -EINVAL;
-    }
-    if(buf == NULL){
-    	pr_err("%s:%d, Invalid user buffer (NULL)\n",__func__,__LINE__);
-    	return -EINVAL;
-    }
-    if(count <= 0){
-    	 pr_err("%s:%d, Invalid Count value\n",__func__,__LINE__);
-    	 return -EINVAL;
-    }
-    if(offset == NULL){
-    	pr_err("%s:%d, Offset pointer is invalid\n",__func__,__LINE__);
-    	return -EINVAL;
-    }
-    if(*offset > BUFFER_SIZE){
-    	return -ENOSPC;
-    }
-    space_available = BUFFER_SIZE - (*offset);
-    pr_debug("%s:%d space_available = %ld\n",__func__,__LINE__,space_available);
-    pr_debug("%s:%d write byte count = %ld\n",__func__,__LINE__,count);
-    pr_debug("%s:%d write offset = %lld\n",__func__,__LINE__,*offset);
-    if(count > space_available){
-    	   count = space_available;
-    }
-    if(copy_from_user(event_data.data + *offset,buf,count)){
-    	    pr_err("%s:%d, copy_from_user Failed\n",__func__,__LINE__);
-    	    return -EFAULT;
-    }
-    *offset+=count;
-    event_data.length = *offset;
-
-    return count;
-}
-static int event_release(struct inode *inode,struct file *filp){
-	pr_info("File closed successfully...");
-	return 0;
+static int event_release(struct inode *inode, struct file *filp) {
+    pr_info("eventlogger: device closed by process \"%s\" (pid %d)\n",
+            current->comm, current->pid);
+    return 0;
 }
 
-static ssize_t timestamp_read(struct file *filp,char __user *buf,size_t count,loff_t *offset){
+static ssize_t timestamp_read(struct file *filp, char __user *buf, size_t count, loff_t *offset) {
     char kbuf[64];
     int len;
     ktime_t event_time;
-
     unsigned long flags;
     u64 event_number;
-
     int ret;
-    ret = wait_event_interruptible(event_queue,ring_buf.count > 0);
-    if(ret){
+
+    ret = wait_event_interruptible(event_queue, ring_buf.count > 0);
+    if (ret)
         return ret;
-    }
-    spin_lock_irqsave(&lock,flags);
-    if(ring_buf.count == 0){
-        spin_unlock_irqrestore(&lock,flags);
+
+    spin_lock_irqsave(&lock, flags);
+    if (ring_buf.count == 0) {
+        spin_unlock_irqrestore(&lock, flags);
         return -EAGAIN;
     }
 
@@ -219,77 +115,70 @@ static ssize_t timestamp_read(struct file *filp,char __user *buf,size_t count,lo
     ring_buf.tail = (ring_buf.tail + 1) % CAPACITY;
     ring_buf.count--;
     spin_unlock_irqrestore(&lock, flags);
-    len = snprintf(kbuf,sizeof(kbuf),"Event:%llu,timestamp:%lld\n",event_number, (long long)event_time);
-    if(len > count){
+
+    len = snprintf(kbuf, sizeof(kbuf), "Event:%llu,timestamp:%lld\n",
+                   event_number, (long long)event_time);
+    if (len > count)
         len = count;
-    }
-    if(copy_to_user(buf,kbuf,len)){
+
+    if (copy_to_user(buf, kbuf, len)) {
+        pr_err("eventlogger: copy_to_user failed while returning event #%llu\n", event_number);
         return -EFAULT;
     }
+
     return len;
 }
 
-static long event_ioctl_handler(struct file *filp,unsigned int cmd,unsigned long arg){
+static long event_ioctl_handler(struct file *filp, unsigned int cmd, unsigned long arg) {
     uint64_t total_event;
     uint64_t total_buf_count;
     unsigned long flags;
-    spin_lock_irqsave(&lock,flags);
+
+    spin_lock_irqsave(&lock, flags);
     total_event = total_events_logged;
     total_buf_count = ring_buf.count;
-    spin_unlock_irqrestore(&lock,flags);
+    spin_unlock_irqrestore(&lock, flags);
 
-    switch(cmd){
+    switch (cmd) {
     case GET_RING_BUF_COUNT:
-        if(copy_to_user((int __user *)arg,&total_buf_count,sizeof(total_buf_count))){
+        if (copy_to_user((uint64_t __user *)arg, &total_buf_count, sizeof(total_buf_count))) {
+            pr_err("eventlogger: ioctl GET_RING_BUF_COUNT failed to copy result to userspace\n");
             return -EFAULT;
         }
-        pr_info("Driver: ring buffer present count read successfully\n");
         break;
     case GET_TOTAL_EVENT_LOGGED:
-        if(copy_to_user((int __user *)arg,&total_event,sizeof(total_event))){
+        if (copy_to_user((uint64_t __user *)arg, &total_event, sizeof(total_event))) {
+            pr_err("eventlogger: ioctl GET_TOTAL_EVENT_LOGGED failed to copy result to userspace\n");
             return -EFAULT;
         }
-        pr_info("Driver: Total number of event read successfully..\n");
         break;
     default:
+        pr_warn("eventlogger: received unknown ioctl command 0x%x\n", cmd);
         return -ENOTTY;
     }
     return 0;
-
 }
+
 static struct file_operations event_fops = {
-	.open = event_open,
-	.read= timestamp_read,
-	.write = event_write,
-	.release = event_release,
-    .unlocked_ioctl = event_ioctl_handler
+    .open = event_open,
+    .read = timestamp_read,
+    .release = event_release,
+    .unlocked_ioctl = event_ioctl_handler,
 };
 
-enum hrtimer_restart event_timer_callback(struct hrtimer *event_timer) {
+static irqreturn_t button_irq_handler(int irq, void *dev_id) {
     pending_time = ktime_get();
     schedule_work(&event_work);
-    hrtimer_forward_now(event_timer,ktime_set(5,0));
-    return HRTIMER_RESTART;
+    return IRQ_HANDLED;
 }
 
-
-static void init_hrtimer(void){
-    pr_info("hrtimer initlization starts....\n");
-    ktime_t tim;
-    tim = ktime_set(5,0);
-    hrtimer_setup(&event_timer, event_timer_callback,
-              CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    hrtimer_start(&event_timer,tim,HRTIMER_MODE_REL);
-    pr_info("hrtime init done");
-
-}
-static void event_work_handler(struct work_struct *work){
-
+static void event_work_handler(struct work_struct *work) {
     unsigned long flags;
-    spin_lock_irqsave(&lock,flags);
-    if(ring_buf.count >= CAPACITY){
-        spin_unlock_irqrestore(&lock,flags);
-        pr_warn("Event buffer full, dropping event\n");
+
+    spin_lock_irqsave(&lock, flags);
+    if (ring_buf.count >= CAPACITY) {
+        spin_unlock_irqrestore(&lock, flags);
+        pr_warn("eventlogger: ring buffer full (%d entries) — dropping newest event\n", CAPACITY);
         return;
     }
 
@@ -298,140 +187,151 @@ static void event_work_handler(struct work_struct *work){
     ring_buf.head = (ring_buf.head + 1) % CAPACITY;
     total_events_logged++;
     spin_unlock_irqrestore(&lock, flags);
-   wake_up_interruptible(&event_queue);
-    pr_info("Bottom half: event stored\n");
 
+    wake_up_interruptible(&event_queue);
+    pr_info("eventlogger: event #%llu stored, %llu currently buffered\n",
+            total_events_logged, ring_buf.count);
 }
 
-static int event_data_poll(void *data){
+static int event_stats_thread(void *data) {
     unsigned long flags;
-    while(!(kthread_should_stop())){
-        spin_lock_irqsave(&lock,flags);
-        pr_info("Total event polled into buffer = %llu\n",total_events_logged);
-        pr_info("Number of event remaining in buffer=%llu\n",ring_buf.count);
-        spin_unlock_irqrestore(&lock,flags);
-        schedule_timeout_interruptible(6000);    
+    uint64_t logged, buffered;
+
+    while (!kthread_should_stop()) {
+        spin_lock_irqsave(&lock, flags);
+        logged = total_events_logged;
+        buffered = ring_buf.count;
+        spin_unlock_irqrestore(&lock, flags);
+
+        pr_info("eventlogger: %llu events logged, %llu currently buffered\n",
+                logged, buffered);
+        schedule_timeout_interruptible(msecs_to_jiffies(15000));
     }
+    pr_info("eventlogger: stats thread stopping\n");
     return 0;
-
 }
-static void init_kthread(void){
-    thread = kthread_create(event_data_poll,NULL,"KTHREAD_FOR_POLL");
-    if(thread){
+
+static void init_stats_thread(void) {
+    thread = kthread_create(event_stats_thread, NULL, "eventlogger_stats");
+    if (thread) {
         wake_up_process(thread);
-    }
-    else{
-        pr_err("Cannot create kthread\n");
+    } else {
+        pr_err("eventlogger: failed to start background stats thread\n");
     }
 }
-static irqreturn_t button_irq_handler(int irq, void *dev_id) {
-    pending_time = ktime_get();
-    schedule_work(&event_work);
-    return IRQ_HANDLED;
-}
-static int __init eventInit(void){
-	int ret = 0;
-	ret = alloc_chrdev_region(&event_dev,BASEMINOR,COUNT,DEVICE_NAME);
-	if(ret < 0){
-		pr_err("Failed to allocate device number\n");
-		return ret;
-	}
-	event_cdev = cdev_alloc();
-	if(!event_cdev){
-		unregister_chrdev_region(event_dev,COUNT);
-		return -ENOMEM;
-	}
 
-	event_cdev->ops = &event_fops;
-	event_cdev->owner = THIS_MODULE;
+static int __init eventInit(void) {
+    int ret = 0;
 
-	ret = cdev_add(event_cdev,event_dev,COUNT);
-	if(ret < 0){
-		cdev_del(event_cdev);
-		unregister_chrdev_region(event_dev,COUNT);
-		return ret;
-	}
+    ret = alloc_chrdev_region(&event_dev, BASEMINOR, COUNT, DEVICE_NAME);
+    if (ret < 0) {
+        pr_err("eventlogger: failed to allocate a character device region: %d\n", ret);
+        return ret;
+    }
+
+    event_cdev = cdev_alloc();
+    if (!event_cdev) {
+        pr_err("eventlogger: failed to allocate cdev structure (out of memory)\n");
+        unregister_chrdev_region(event_dev, COUNT);
+        return -ENOMEM;
+    }
+
+    event_cdev->ops = &event_fops;
+    event_cdev->owner = THIS_MODULE;
+
+    ret = cdev_add(event_cdev, event_dev, COUNT);
+    if (ret < 0) {
+        pr_err("eventlogger: failed to add cdev to the kernel: %d\n", ret);
+        cdev_del(event_cdev);
+        unregister_chrdev_region(event_dev, COUNT);
+        return ret;
+    }
 
     event_class = class_create(DEVICE_NAME);
-    if(IS_ERR(event_class)){
-    	ret = PTR_ERR(event_class);
-    	cdev_del(event_cdev);
-    	unregister_chrdev_region(event_dev,COUNT);
-    	pr_err("Failed to create device: error code %d\n", ret);
-    	return ret;
-
+    if (IS_ERR(event_class)) {
+        ret = PTR_ERR(event_class);
+        pr_err("eventlogger: failed to create device class: %d\n", ret);
+        cdev_del(event_cdev);
+        unregister_chrdev_region(event_dev, COUNT);
+        return ret;
     }
-    event_device = device_create(event_class,NULL,event_dev,NULL,DEVICE_NAME);
-    if(IS_ERR(event_device)){
-    	ret = PTR_ERR(event_device);
-         class_destroy(event_class);
-         cdev_del(event_cdev);
-         unregister_chrdev_region(event_dev,COUNT);
-         pr_err("Failed to create device: error code %d\n", ret);
-         return ret;
+
+    event_device = device_create(event_class, NULL, event_dev, NULL, DEVICE_NAME);
+    if (IS_ERR(event_device)) {
+        ret = PTR_ERR(event_device);
+        pr_err("eventlogger: failed to create /dev/%s: %d\n", DEVICE_NAME, ret);
+        class_destroy(event_class);
+        cdev_del(event_cdev);
+        unregister_chrdev_region(event_dev, COUNT);
+        return ret;
     }
-  gpiod_add_lookup_table(&gpios_table);
 
-  button = gpiod_get(event_device, "event-button", GPIOD_IN);
-  if (IS_ERR(button)) {
-      ret = PTR_ERR(button);
-      pr_err("Failed to get GPIO descriptor: %d\n", ret);
-      gpiod_remove_lookup_table(&gpios_table);
-      device_destroy(event_class, event_dev);
-      class_destroy(event_class);
-      cdev_del(event_cdev);
-      unregister_chrdev_region(event_dev, COUNT);
-      return ret;
-  }
+    gpiod_add_lookup_table(&gpios_table);
 
-  ret = gpiod_direction_input(button);
-  irq = gpiod_to_irq(button);
-  if (ret < 0 || irq < 0) {
-      gpiod_put(button);
-      gpiod_remove_lookup_table(&gpios_table);
-      device_destroy(event_class, event_dev);
-      class_destroy(event_class);
-      cdev_del(event_cdev);
-      unregister_chrdev_region(event_dev, COUNT);
-      pr_err("GPIO direction configuration failed\n");
-      return (ret < 0) ? ret : irq;
-  }
+    button = gpiod_get(event_device, "event-button", GPIOD_IN);
+    if (IS_ERR(button)) {
+        ret = PTR_ERR(button);
+        pr_err("eventlogger: failed to acquire GPIO%d descriptor: %d (check wiring / lookup table)\n",
+               GPIO_LINE, ret);
+        gpiod_remove_lookup_table(&gpios_table);
+        device_destroy(event_class, event_dev);
+        class_destroy(event_class);
+        cdev_del(event_cdev);
+        unregister_chrdev_region(event_dev, COUNT);
+        return ret;
+    }
 
-  ret = request_irq(irq, button_irq_handler, IRQF_TRIGGER_FALLING,
-                     "event-button", DEVICE_NAME);
-  if (ret) {
-      gpiod_put(button);
-      gpiod_remove_lookup_table(&gpios_table);
-      device_destroy(event_class, event_dev);
-      class_destroy(event_class);
-      cdev_del(event_cdev);
-      unregister_chrdev_region(event_dev, COUNT);
-      pr_err("irq request failed\n");
-      return ret;
-  }
+    ret = gpiod_direction_input(button);
+    irq = gpiod_to_irq(button);
+    if (ret < 0 || irq < 0) {
+        pr_err("eventlogger: failed to configure GPIO%d as interrupt input (dir_ret=%d, irq=%d)\n",
+               GPIO_LINE, ret, irq);
+        gpiod_put(button);
+        gpiod_remove_lookup_table(&gpios_table);
+        device_destroy(event_class, event_dev);
+        class_destroy(event_class);
+        cdev_del(event_cdev);
+        unregister_chrdev_region(event_dev, COUNT);
+        return (ret < 0) ? ret : irq;
+    }
+
+    ret = request_irq(irq, button_irq_handler, IRQF_TRIGGER_FALLING,
+                       "event-button", DEVICE_NAME);
+    if (ret) {
+        pr_err("eventlogger: failed to register IRQ %u for GPIO%d: %d\n", irq, GPIO_LINE, ret);
+        gpiod_put(button);
+        gpiod_remove_lookup_table(&gpios_table);
+        device_destroy(event_class, event_dev);
+        class_destroy(event_class);
+        cdev_del(event_cdev);
+        unregister_chrdev_region(event_dev, COUNT);
+        return ret;
+    }
+
     spin_lock_init(&lock);
     INIT_WORK(&event_work, event_work_handler);
     init_waitqueue_head(&event_queue);
-    //init_hrtimer();
-    init_kthread();
+    init_stats_thread();
 
-	pr_info("Module init done...\n");
-	pr_info("Device Name : %s\n",DEVICE_NAME);
-	pr_info("major = %d, minor = %d\n",MAJOR(event_dev),MINOR(event_dev));
-	return 0;
+    pr_info("eventlogger: ready — /dev/%s (major=%d, minor=%d), listening on GPIO%d via IRQ %u\n",
+            DEVICE_NAME, MAJOR(event_dev), MINOR(event_dev), GPIO_LINE, irq);
+    return 0;
 }
-static void __exit eventExit(void){
-      free_irq(irq, DEVICE_NAME);
-      gpiod_put(button);
-      gpiod_remove_lookup_table(&gpios_table);
-         kthread_stop(thread);
-         //hrtimer_cancel(&event_timer);
-         cancel_work_sync(&event_work);
-         device_destroy(event_class,event_dev);
-         class_destroy(event_class);
-         cdev_del(event_cdev);
-         unregister_chrdev_region(event_dev,COUNT);
-	     pr_info("Module exited...\n");
+
+static void __exit eventExit(void) {
+    free_irq(irq, DEVICE_NAME);
+    gpiod_put(button);
+    gpiod_remove_lookup_table(&gpios_table);
+
+    kthread_stop(thread);
+    cancel_work_sync(&event_work);
+
+    device_destroy(event_class, event_dev);
+    class_destroy(event_class);
+    cdev_del(event_cdev);
+    unregister_chrdev_region(event_dev, COUNT);
+
+    pr_info("eventlogger: unloaded, %llu events were logged this session\n", total_events_logged);
 }
 
 module_init(eventInit);
